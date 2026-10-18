@@ -21,8 +21,11 @@
 //!
 //! A failed GPU is temporarily excluded; recovery tries another healthy GPU
 //! before strict CPU without changing the saved preference. Failed devices
-//! are retried between dictations after a cooldown, so idle Handy does no
-//! hardware polling. Recovery handles driver faults; it cannot repair the driver.
+//! are retried after a cooldown. Healthy Auto separately discovers GPUs that
+//! appear later, even when its current device has never failed. Both checks
+//! run between dictations when due, so idle Handy does no hardware polling
+//! and active live streams keep their decoder. Recovery handles driver faults;
+//! it cannot repair the underlying driver.
 //!
 //! An explicit GPU preference is retried after failures, while an explicit CPU
 //! preference or host GPU restriction prevents GPU upgrades. CLI device indices

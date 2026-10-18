@@ -50,13 +50,19 @@ const SAMPLE_RATE: f64 = 16_000.0;
 const MAX_GPU_RECOVERY_ATTEMPTS: usize = 8;
 const GPU_RECHECK_INITIAL: Duration = Duration::from_secs(30);
 const GPU_RECHECK_MAX: Duration = Duration::from_secs(300);
+/// Auto can start successfully before a more capable GPU becomes visible.
+const AUTO_DEVICE_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Only consulted when a dictation starts; no background hardware polling.
+/// Healthy Auto needs discovery even without a previous failure: a dedicated
+/// GPU may be powered off at startup or appear after a driver restart.
 /// Failure retries use exponential backoff from GPU_RECHECK_INITIAL to
 /// GPU_RECHECK_MAX, taking precedence over discovery to avoid repeatedly
 /// probing an unstable driver. Successful model loading alone is not enough
 /// to reset that backoff; inference must succeed on the normal device.
 struct GpuRecheck {
+    /// Discovery is independent of inference success and failure backoff.
+    discovery_next: Option<Instant>,
     next: Option<Instant>,
     delay: Duration,
 }
@@ -64,6 +70,7 @@ struct GpuRecheck {
 impl Default for GpuRecheck {
     fn default() -> Self {
         Self {
+            discovery_next: None,
             next: None,
             delay: GPU_RECHECK_INITIAL,
         }
@@ -72,7 +79,10 @@ impl Default for GpuRecheck {
 
 impl GpuRecheck {
     fn due(&self) -> bool {
-        self.next.is_some_and(|next| Instant::now() >= next)
+        // Failure cooldown takes precedence over routine Auto discovery.
+        self.next
+            .or(self.discovery_next)
+            .is_some_and(|next| Instant::now() >= next)
     }
 
     fn schedule(&mut self) {
@@ -1027,7 +1037,8 @@ impl Owner {
     }
 
     /// Compare the bound device with the original request, preserving the
-    /// saved preference while a temporary replacement is used.
+    /// saved preference while a temporary replacement is used. Only healthy
+    /// Auto needs routine discovery; an explicit GPU only needs failure retries.
     fn update_gpu_recheck(&self, spec: &LoadSpec, info: &LoadedInfo) {
         let fallback = self.shared.gpu_allowed
             && !spec.cpu_only()
@@ -1041,14 +1052,25 @@ impl Owner {
         let was_fallback = self.shared.fallback_active.swap(fallback, Ordering::AcqRel);
         let mut recheck = lock(&self.shared.gpu_recheck);
         if fallback {
+            recheck.discovery_next = None;
             self.shared
                 .device_restore_pending
                 .store(false, Ordering::Release);
             recheck.schedule();
         } else {
-            // Loading suspends checks, but does not prove inference is healthy.
-            // Keep the longer delay in case this device fails again immediately.
+            // Loading does not prove inference is healthy. Preserve failure
+            // delay, while healthy Auto still discovers devices added later.
             recheck.next = None;
+            if self.shared.gpu_allowed
+                && !spec.cpu_only()
+                && matches!(spec.device, DeviceSelector::Auto)
+            {
+                recheck
+                    .discovery_next
+                    .get_or_insert_with(|| Instant::now() + AUTO_DEVICE_RECHECK_INTERVAL);
+            } else {
+                recheck.discovery_next = None;
+            }
             if was_fallback && info.on_gpu && !spec.cpu_only() && !spec.pinned() {
                 self.shared
                     .device_restore_pending
@@ -1072,7 +1094,13 @@ impl Owner {
         else {
             return;
         };
-        *lock(&self.shared.gpu_recheck) = GpuRecheck::default();
+        {
+            let mut recheck = lock(&self.shared.gpu_recheck);
+            recheck.delay = GPU_RECHECK_INITIAL;
+            recheck.next = None;
+            // Successful dictations must not postpone Auto discovery forever.
+            // Its deadline advances only when a scan is actually attempted.
+        }
         if self
             .shared
             .device_restore_pending
@@ -1141,7 +1169,7 @@ impl Owner {
         }
     }
 
-    /// Probe in an isolated, model-less worker when recovery is due. A
+    /// Probe in an isolated, model-less worker when discovery or recovery is due. A
     /// successful enumeration alone never clears a device's failure state:
     /// it must also load the model. Fresh enumeration resolves stable device
     /// identities again because driver restarts can change registry indices.
@@ -1161,7 +1189,16 @@ impl Owner {
             return Ok(None);
         }
         // Reserve this attempt before touching the driver, including failures.
-        lock(&self.shared.gpu_recheck).back_off();
+        // Routine discovery stays at 60 seconds; failed-device retries retain
+        // their independent, increasing cooldown.
+        {
+            let mut recheck = lock(&self.shared.gpu_recheck);
+            if recheck.next.is_some() {
+                recheck.back_off();
+            } else {
+                recheck.discovery_next = Some(Instant::now() + AUTO_DEVICE_RECHECK_INTERVAL);
+            }
+        }
         let epoch = self.shared.epoch();
         let probe = (|| {
             let _probing = lock(&self.shared.probing);
@@ -1593,6 +1630,18 @@ struct StartFailure {
     device: Option<(String, String)>,
 }
 
+/// Shared system RAM is not comparable to dedicated VRAM. Match upstream's
+/// preference for discrete GPUs before using memory to order peers. Use the
+/// backend's GPU/IGPU classification rather than vendor names. This is a
+/// selection heuristic, not a performance benchmark; stable keys break ties
+/// in the callers so re-enumeration order does not choose the winner.
+fn gpu_rank(device: &DeviceInfo) -> (bool, u64) {
+    (
+        device.device_type == transcribe_cpp::DeviceType::Gpu,
+        device.memory_total,
+    )
+}
+
 /// Keep the requested preference intact while selecting a temporary worker.
 /// Exclude each failed GPU independently, so a failed integrated GPU can fall
 /// back to a healthy dedicated GPU (or vice versa) before strict CPU is needed.
@@ -1624,8 +1673,8 @@ fn select_recovery_spec(
         .find(|device| preferred == Some(&device.key))
         .or_else(|| {
             healthy().max_by(|a, b| {
-                a.memory_total
-                    .cmp(&b.memory_total)
+                gpu_rank(a)
+                    .cmp(&gpu_rank(b))
                     .then_with(|| a.key.cmp(&b.key))
             })
         });
@@ -1654,8 +1703,8 @@ fn upgrade_candidate<'a>(
         .iter()
         .filter(|device| device.is_gpu())
         .max_by(|a, b| {
-            a.memory_total
-                .cmp(&b.memory_total)
+            gpu_rank(a)
+                .cmp(&gpu_rank(b))
                 .then_with(|| a.key.cmp(&b.key))
         });
     let candidate = devices
@@ -1672,7 +1721,7 @@ fn upgrade_candidate<'a>(
             let active = devices
                 .iter()
                 .find(|device| Some(&device.key) == current.device_key.as_ref());
-            if active.is_some_and(|active| active.memory_total >= candidate.memory_total) {
+            if active.is_some_and(|active| gpu_rank(active) >= gpu_rank(candidate)) {
                 return None;
             }
         }
