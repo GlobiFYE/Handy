@@ -85,6 +85,7 @@ pub enum StreamPhase {
 pub enum StreamWorkKind {
     Transcribing,
     Polishing,
+    Recovering,
 }
 
 /// Emitted to switch the streaming overlay to a working spinner.
@@ -274,8 +275,9 @@ impl TranscriptionManager {
     pub fn new(app_handle: &AppHandle, model_manager: Arc<ModelManager>) -> Result<Self> {
         let fallback_app = app_handle.clone();
         let restored_app = app_handle.clone();
+        let upgraded_app = app_handle.clone();
         let manager = Self {
-            engine: EngineSupervisor::with_device_handlers(
+            engine: EngineSupervisor::with_device_upgrade_handler(
                 !transcribe_gpu_disabled_for_host(),
                 move |info| {
                     let _ = fallback_app.emit(
@@ -292,6 +294,14 @@ impl TranscriptionManager {
                 move |info| {
                     let _ = restored_app.emit(
                         "transcription-device-restored",
+                        TranscriptionDeviceEvent {
+                            device_name: info.device.clone(),
+                        },
+                    );
+                },
+                move |info| {
+                    let _ = upgraded_app.emit(
+                        "transcription-device-upgraded",
                         TranscriptionDeviceEvent {
                             device_name: info.device.clone(),
                         },
@@ -1888,6 +1898,7 @@ pub struct ActiveTranscriptionDevice {
     pub name: String,
     pub on_gpu: bool,
     pub is_fallback: bool,
+    pub is_pending: bool,
 }
 
 #[derive(Serialize, Clone, Debug, Type)]
@@ -1920,10 +1931,17 @@ pub fn get_available_accelerators(tm: &TranscriptionManager) -> AvailableAcceler
                 .transcribe_gpu_device
                 .as_deref()
                 .is_some_and(|key| info.device_key.as_deref() != Some(key));
+        // A manual setting change is applied on the next model use. The old
+        // binding is still healthy; a mismatch here is not a device failure.
+        let reload_pending = tm.reload_model_on_next_use.load(Ordering::Acquire);
+        let selection_mismatch = preferred_missing
+            || (settings.transcribe_accelerator == TranscribeAcceleratorSetting::Cpu
+                && info.on_gpu);
         ActiveTranscriptionDevice {
             name: info.device,
             on_gpu: info.on_gpu,
-            is_fallback: tm.engine.is_in_fallback() || preferred_missing,
+            is_fallback: !reload_pending && (tm.engine.is_in_fallback() || preferred_missing),
+            is_pending: reload_pending && selection_mismatch,
         }
     });
     AvailableAccelerators {

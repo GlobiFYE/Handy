@@ -287,6 +287,8 @@ struct Shared {
     on_device_fallback: Option<OnDeviceFallback>,
     on_device_restored: Option<OnDeviceFallback>,
     device_restore_pending: AtomicBool,
+    on_device_upgraded: Option<OnDeviceFallback>,
+    device_upgrade_pending: AtomicBool,
     /// The loaded model (logically: it stays loaded while its worker is
     /// replaced after a crash or cancel).
     loaded: Mutex<Option<LoadedInfo>>,
@@ -464,6 +466,22 @@ impl EngineSupervisor {
         on_device_fallback: impl Fn(&LoadedInfo) + Send + Sync + 'static,
         on_device_restored: impl Fn(&LoadedInfo) + Send + Sync + 'static,
     ) -> Self {
+        Self::with_device_upgrade_handler(
+            gpu_allowed,
+            on_device_fallback,
+            on_device_restored,
+            |_| {},
+        )
+    }
+
+    /// Device upgrades are reported after successful inference on a newly
+    /// selected, higher-ranked GPU; loading it alone is not confirmation.
+    pub fn with_device_upgrade_handler(
+        gpu_allowed: bool,
+        on_device_fallback: impl Fn(&LoadedInfo) + Send + Sync + 'static,
+        on_device_restored: impl Fn(&LoadedInfo) + Send + Sync + 'static,
+        on_device_upgraded: impl Fn(&LoadedInfo) + Send + Sync + 'static,
+    ) -> Self {
         #[cfg(all(unix, not(test)))]
         record_launched_exe();
         let (commands, queue) = mpsc::channel();
@@ -471,6 +489,7 @@ impl EngineSupervisor {
             gpu_allowed,
             on_device_fallback: Some(Box::new(on_device_fallback)),
             on_device_restored: Some(Box::new(on_device_restored)),
+            on_device_upgraded: Some(Box::new(on_device_upgraded)),
             ..Shared::default()
         });
         let owner = Owner {
@@ -527,6 +546,9 @@ impl EngineSupervisor {
             .store(false, Ordering::Release);
         self.shared
             .device_restore_pending
+            .store(false, Ordering::Release);
+        self.shared
+            .device_upgrade_pending
             .store(false, Ordering::Release);
         let had_device_failures = !lock(&self.shared.failed_gpus).is_empty();
         lock(&self.shared.failed_gpus).clear();
@@ -598,11 +620,24 @@ impl EngineSupervisor {
     /// Begin a live stream on the loaded model. `on_progress` runs on the
     /// owner thread after every feed, so it must not block or call back into
     /// the supervisor.
+    #[cfg(test)]
     pub fn start_stream(
         &self,
         run: RunOptions,
         stream: StreamOptions,
         on_progress: impl FnMut(StreamProgress) + Send + 'static,
+    ) -> Result<StreamHandle, EngineError> {
+        self.start_stream_with_failure_handler(run, stream, on_progress, || {})
+    }
+
+    /// Report a lost live stream once, so the UI can explain why preview
+    /// stopped while recording continues. Callbacks must not block or reenter.
+    pub fn start_stream_with_failure_handler(
+        &self,
+        run: RunOptions,
+        stream: StreamOptions,
+        on_progress: impl FnMut(StreamProgress) + Send + 'static,
+        on_lost: impl FnMut() + Send + 'static,
     ) -> Result<StreamHandle, EngineError> {
         let id = self.shared.next_id();
         // The stream is one piece of cancellable work: a cancel from here on
@@ -615,6 +650,7 @@ impl EngineSupervisor {
                 epoch,
                 closed: Arc::clone(&closed),
                 on_progress: Box::new(on_progress),
+                on_lost: Box::new(on_lost),
                 pending_ms: 0,
             },
             run,
@@ -794,6 +830,7 @@ struct ActiveStream {
     /// Set when the caller drops its handle.
     closed: Arc<AtomicBool>,
     on_progress: OnProgress,
+    on_lost: Box<dyn FnMut() + Send>,
     /// Audio received but not yet committed, which finalize must still
     /// decode; sizes the feed and finalize deadlines.
     pending_ms: i64,
@@ -1056,6 +1093,9 @@ impl Owner {
             self.shared
                 .device_restore_pending
                 .store(false, Ordering::Release);
+            self.shared
+                .device_upgrade_pending
+                .store(false, Ordering::Release);
             recheck.schedule();
         } else {
             // Loading does not prove inference is healthy. Preserve failure
@@ -1110,6 +1150,18 @@ impl Owner {
             if let Some(handler) = &self.shared.on_device_restored {
                 if catch_unwind(AssertUnwindSafe(|| handler(info))).is_err() {
                     error!("Transcription device restoration callback panicked");
+                }
+            }
+        }
+        if self
+            .shared
+            .device_upgrade_pending
+            .swap(false, Ordering::AcqRel)
+        {
+            info!("Transcription confirmed on upgraded GPU '{}'", info.device);
+            if let Some(handler) = &self.shared.on_device_upgraded {
+                if catch_unwind(AssertUnwindSafe(|| handler(info))).is_err() {
+                    error!("Transcription device upgrade callback panicked");
                 }
             }
         }
@@ -1229,6 +1281,12 @@ impl Owner {
         let Some(candidate) = upgrade_candidate(&spec, current, &devices) else {
             return Ok(None);
         };
+        let auto_upgrade = matches!(spec.device, DeviceSelector::Auto)
+            && current.is_some_and(|info| info.on_gpu)
+            && current
+                .and_then(|info| info.device_key.as_ref())
+                .and_then(|key| devices.iter().find(|device| &device.key == key))
+                .is_some_and(|active| gpu_rank(candidate) > gpu_rank(active));
         let previous = current.cloned();
         let key = candidate.key.clone();
         let name = candidate.label().to_string();
@@ -1254,6 +1312,16 @@ impl Owner {
                     "Automatic GPU recheck bound '{}' ({})",
                     info.device, info.backend
                 );
+                if auto_upgrade && info.on_gpu && info.device_key.as_ref() == Some(&key) {
+                    // Prefer a single upgrade notice over a simultaneous
+                    // recovery notice if both transitions were still pending.
+                    self.shared
+                        .device_restore_pending
+                        .store(false, Ordering::Release);
+                    self.shared
+                        .device_upgrade_pending
+                        .store(true, Ordering::Release);
+                }
                 Ok(Some(info))
             }
             Err(error) => {
@@ -1537,8 +1605,17 @@ impl Owner {
             // Later feeds are skipped, and finalize reports the cancel.
             Err(Failure::Cancelled) => {}
             Err(failure) => {
-                self.stream = None;
+                let lost = self.stream.take();
                 self.worker_lost("stream feed", &failure);
+                if let Some(mut stream) = lost {
+                    // Cancelled/closed recordings must not receive stale UI events.
+                    if !stream.closed.load(Ordering::Acquire)
+                        && !self.shared.cancelled_since(stream.epoch)
+                        && catch_unwind(AssertUnwindSafe(|| (stream.on_lost)())).is_err()
+                    {
+                        error!("Live transcription failure callback panicked");
+                    }
+                }
             }
         }
     }

@@ -59,6 +59,7 @@ export const AccelerationSelector: FC<AccelerationSelectorProps> = ({
     [],
   );
   const [usableDeviceCount, setUsableDeviceCount] = useState(0);
+  const [selectedGpuName, setSelectedGpuName] = useState("");
   const [activeDevice, setActiveDevice] =
     useState<ActiveTranscriptionDevice | null>(null);
   const refreshRef = useRef<() => void>(() => {});
@@ -102,6 +103,10 @@ export const AccelerationSelector: FC<AccelerationSelectorProps> = ({
         setUsableDeviceCount(
           available.gpu_devices.filter((device) => device.available).length +
             Number(available.transcribe.includes("cpu")),
+        );
+        setSelectedGpuName(
+          available.gpu_devices.find((device) => device.id === currentGpuDevice)
+            ?.name || t("settings.advanced.acceleration.preferredGpu"),
         );
         setTranscribeOptions(opts);
         setActiveDevice(available.active_device);
@@ -152,10 +157,31 @@ export const AccelerationSelector: FC<AccelerationSelectorProps> = ({
     await updateSetting("transcribe_accelerator", accelerator);
   };
 
+  // The dropdown is the saved preference. Explain Auto only when multiple
+  // usable devices exist, and hide redundant status for a matching explicit
+  // choice. A manual switch is neutral until applied; amber is reserved for
+  // actual fallback, even when CPU is the only remaining usable device.
   const showActiveDevice =
     activeDevice !== null &&
-    (activeDevice.is_fallback ||
+    (activeDevice.is_pending ||
+      activeDevice.is_fallback ||
       (currentTranscribe === "auto" && usableDeviceCount > 1));
+
+  let deviceStatus = "";
+  if (activeDevice?.is_pending) {
+    deviceStatus = t("settings.advanced.acceleration.pendingSwitch", {
+      device: currentTranscribe === "cpu" ? "CPU" : selectedGpuName,
+    });
+  } else if (activeDevice) {
+    deviceStatus = t(
+      activeDevice.is_fallback
+        ? "settings.advanced.acceleration.currentlyUsingFallback"
+        : "settings.advanced.acceleration.currentlyUsing",
+      {
+        device: activeDevice.on_gpu ? activeDevice.name : t("errors.backupCpu"),
+      },
+    );
+  }
 
   return (
     <SettingContainer
@@ -185,16 +211,7 @@ export const AccelerationSelector: FC<AccelerationSelectorProps> = ({
             }`}
             aria-live="polite"
           >
-            {t(
-              activeDevice.is_fallback
-                ? "settings.advanced.acceleration.currentlyUsingFallback"
-                : "settings.advanced.acceleration.currentlyUsing",
-              {
-                device: activeDevice.on_gpu
-                  ? activeDevice.name
-                  : t("errors.backupCpu"),
-              },
-            )}
+            {deviceStatus}
           </p>
         )}
       </div>
