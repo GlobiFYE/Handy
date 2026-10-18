@@ -7,8 +7,8 @@
 //!
 //! [`EngineSupervisor`] is the single owner of that worker. It loads and
 //! unloads models, runs and streams transcriptions, cancels them, and
-//! recovers from crashes and hangs (retrying in a CPU-only worker when the
-//! GPU was at fault), so the rest of the app never sees processes, restarts
+//! recovers from crashes and hangs (trying another healthy GPU before CPU
+//! after a device failure), so the rest of the app never sees processes, restarts
 //! or fallback. At most one worker holds a model at a time, and it lives
 //! exactly as long as that model, so unloading returns all of its CPU and GPU
 //! memory to the OS. Listing compute devices may briefly run a second,
@@ -18,6 +18,15 @@
 //! backends before any are registered, so no GPU driver code runs in it at
 //! all: a driver that crashes or hangs while initializing can't take the CPU
 //! fallback down with it.
+//!
+//! A failed GPU is temporarily excluded; recovery tries another healthy GPU
+//! before strict CPU without changing the saved preference. Failed devices
+//! are retried between dictations after a cooldown, so idle Handy does no
+//! hardware polling. Recovery handles driver faults; it cannot repair the driver.
+//!
+//! An explicit GPU preference is retried after failures, while an explicit CPU
+//! preference or host GPU restriction prevents GPU upgrades. CLI device indices
+//! are strict diagnostic selections: their errors do not trigger fallback.
 //!
 //! - `protocol`: the framed request/response protocol between the two.
 //! - `supervisor`: the parent side ([`EngineSupervisor`]).
